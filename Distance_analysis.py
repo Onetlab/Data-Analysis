@@ -6,8 +6,21 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 from scipy.signal import find_peaks, savgol_filter
 import re
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.svm import SVR
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import GridSearchCV, train_test_split, cross_val_score
+from sklearn.metrics import r2_score
+import joblib
 import os
+from sklearn.inspection import PartialDependenceDisplay, permutation_importance
 import sys
+import streamlit as st
+import pandas as pd
+import numpy as np
+import plotly.graph_objs as go
+from scipy.signal import find_peaks
+import re
 import json
 
 st.set_page_config(layout="wide")
@@ -101,18 +114,6 @@ def load_params():
             return json.load(file)
     else:
         return {}
-
-def build_model(hp):
-    model = keras.Sequential()
-    model.add(keras.layers.Input(shape=(6,)))  # Updated input shape to 6 features
-    for i in range(hp.Int('num_layers', 1, 3)):
-        model.add(keras.layers.Dense(units=hp.Int('units_' + str(i), min_value=32, max_value=512, step=32),
-                                     activation=hp.Choice('activation_' + str(i), ['relu', 'tanh'])))
-    model.add(keras.layers.Dense(1))
-    model.compile(optimizer=keras.optimizers.Adam(hp.Choice('learning_rate', [1e-2, 1e-3, 1e-4])),
-                  loss='mse',
-                  metrics=['mse'])
-    return model
 
 
 
@@ -430,6 +431,280 @@ if uploaded_files:
     )
 
     st.plotly_chart(fig_box_avg)
+
+if st.button('Run Machine Learning Analysis'):
+    st.subheader("Machine Learning Analysis")
+    
+    # Prepare data for ML models
+    all_data = []
+    for df, metadata in zip(filtered_data_frames, filtered_metadata_list):
+        for index, row in df.iterrows():
+            all_data.append({
+                'Position': row['Position'],
+                'dBm': row['dBm'],
+                'step': metadata['step'],
+                'delay': metadata['delay'],
+                'base_distance': metadata['base_distance'],
+                'surface': metadata['surface'],
+                'port': metadata['port']
+            })
+
+    all_data_df = pd.DataFrame(all_data)
+    
+    # Encode categorical feature 'surface'
+    all_data_df = pd.get_dummies(all_data_df, columns=['surface'], drop_first=True)
+
+    features = all_data_df[['Position', 'step', 'delay', 'base_distance', 'surface_smooth', 'port']]
+    target = all_data_df['dBm']
+
+    # Remove infinite and NaN values from features and target
+    features = features.replace([np.inf, -np.inf], np.nan).dropna()
+    target = target.replace([np.inf, -np.inf], np.nan).dropna()
+
+    # Ensure all columns are numeric
+    features = features.apply(pd.to_numeric, errors='coerce')
+
+    # Align target with features indices
+    features = features.loc[target.index].dropna()
+    target = target.loc[features.index]
+
+    # Sanity check for extremely large values
+    if (features > 1e10).any().any():
+        st.write("Warning: Features contain extremely large values. Please check your data.")
+    if (target > 1e10).any():
+        st.write("Warning: Target contains extremely large values. Please check your data.")
+
+    # Split the data into training and testing sets
+    X_train, X_test, y_train, y_test = train_test_split(features, target, test_size=0.2, random_state=42)
+
+
+    # Normalize the features
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train)
+    X_test_scaled = scaler.transform(X_test)
+
+    # Option to upload pre-trained models
+    st.sidebar.subheader("Upload Pre-trained Models")
+    rf_model_file = st.sidebar.file_uploader("Upload Random Forest Model", type=["pkl"])
+    dl_model_file = st.sidebar.file_uploader("Upload Deep Learning Model", type=["h5"])
+
+    # Random Forest Model
+    if rf_model_file:
+        best_rf = joblib.load(rf_model_file)
+    else:
+        param_grid = {
+            'n_estimators': [50, 100, 200, 500],
+            'max_depth': [10, 20, 30, None],
+            'min_samples_split': [2, 5, 10, 20],
+            'min_samples_leaf': [1, 2, 4, 10],
+            'max_features': [None, 'sqrt', 'log2']
+        }
+
+        rf = RandomForestRegressor()
+
+        grid_search = GridSearchCV(estimator=rf, param_grid=param_grid, cv=3, n_jobs=-1, verbose=2)
+        
+        grid_search.fit(X_train, y_train)
+
+        st.write("Best parameters found for Random Forest: ", grid_search.best_params_)
+
+        best_rf = grid_search.best_estimator_
+
+        model_path = "best_rf_model.pkl"
+        joblib.dump(best_rf, model_path)
+        st.write(f"Random Forest model saved at {os.path.abspath(model_path)}")
+
+        with open(model_path, "rb") as f:
+            st.download_button(label="Download Random Forest Model", data=f, file_name="best_rf_model.pkl", mime="application/octet-stream")
+
+    cv_scores = cross_val_score(best_rf, X_train, y_train, cv=5)
+    st.write("Cross-validation scores for Random Forest: ", cv_scores)
+    st.write("Mean cross-validation score: ", np.mean(cv_scores))
+
+    best_rf.fit(X_train, y_train)
+
+    y_pred_rf = best_rf.predict(X_test)
+
+    st.write("Random Forest R^2 score on test set: ", r2_score(y_test, y_pred_rf))
+
+    # Gradient Boosting Regressor
+    param_grid_gbr = {
+        'n_estimators': [50, 100, 200, 500],
+        'max_depth': [3, 5, 7, 9],
+        'learning_rate': [0.01, 0.05, 0.1, 0.2],
+        'subsample': [0.8, 0.9, 1.0]
+    }
+
+    gbr = GradientBoostingRegressor()
+
+    grid_search_gbr = GridSearchCV(estimator=gbr, param_grid=param_grid_gbr, cv=3, n_jobs=-1, verbose=2)
+    grid_search_gbr.fit(X_train, y_train)
+
+    st.write("Best parameters found for Gradient Boosting Regressor: ", grid_search_gbr.best_params_)
+
+    best_gbr = grid_search_gbr.best_estimator_
+
+    cv_scores_gbr = cross_val_score(best_gbr, X_train, y_train, cv=5)
+    st.write("Cross-validation scores for Gradient Boosting Regressor: ", cv_scores_gbr)
+    st.write("Mean cross-validation score: ", np.mean(cv_scores_gbr))
+
+    best_gbr.fit(X_train, y_train)
+
+    y_pred_gbr = best_gbr.predict(X_test)
+
+    st.write("Gradient Boosting Regressor R^2 score on test set: ", r2_score(y_test, y_pred_gbr))
+
+    # Support Vector Regressor
+    param_grid_svr = {
+        'C': [0.1, 1, 10, 100],
+        'epsilon': [0.01, 0.1, 1],
+        'kernel': ['linear', 'poly', 'rbf']
+    }
+
+    svr = SVR()
+
+    grid_search_svr = GridSearchCV(estimator=svr, param_grid=param_grid_svr, cv=3, n_jobs=-1, verbose=2)
+    grid_search_svr.fit(X_train, y_train)
+
+    st.write("Best parameters found for Support Vector Regressor: ", grid_search_svr.best_params_)
+
+    best_svr = grid_search_svr.best_estimator_
+
+    cv_scores_svr = cross_val_score(best_svr, X_train, y_train, cv=5)
+    st.write("Cross-validation scores for Support Vector Regressor: ", cv_scores_svr)
+    st.write("Mean cross-validation score: ", np.mean(cv_scores_svr))
+
+    best_svr.fit(X_train, y_train)
+
+    y_pred_svr = best_svr.predict(X_test)
+
+    st.write("Support Vector Regressor R^2 score on test set: ", r2_score(y_test, y_pred_svr))
+
+    # Predict dBm values for a new set of parameters
+    st.subheader("Predict dBm Values for New Parameters")
+
+    step = st.number_input('Step Size (mm)', min_value=0.01, max_value=10.0, value=0.1)
+    delay = st.number_input('Delay (s)', min_value=1, max_value=10, value=2)
+    base_distance = st.number_input('Base Distance (m)', min_value=0.1, max_value=10.0, value=0.5)
+    surface = st.selectbox('Surface', ['rough', 'smooth'])
+    port = st.number_input('Port Number', min_value=1, max_value=10, value=1)
+    positions = np.linspace(all_data_df['Position'].min(), all_data_df['Position'].max(), 1000)
+
+    new_features = pd.DataFrame({
+        'Position': positions,
+        'step': [step] * len(positions),
+        'delay': [delay] * len(positions),
+        'base_distance': [base_distance] * len(positions),
+        'surface_smooth': [1 if surface == 'smooth' else 0] * len(positions),
+        'port': [port] * len(positions)
+    })
+
+    # Random Forest predictions
+    predicted_dbm_rf = best_rf.predict(new_features)
+
+    # Gradient Boosting Regressor predictions
+    predicted_dbm_gbr = best_gbr.predict(new_features)
+
+    # Support Vector Regressor predictions
+    predicted_dbm_svr = best_svr.predict(new_features)
+
+    # Function to create and display plot
+    def create_and_display_plot(positions, predicted_dbm, model_name):
+        st.write(f"Debug: About to create {model_name} plot")
+        try:
+            predicted_peaks, predicted_troughs = find_peaks_troughs(predicted_dbm, distance=1, prominence=0.5, width=1)
+            
+            st.write(f"Predicted Peaks at Positions ({model_name}): {positions[predicted_peaks]}")
+            st.write(f"Predicted Troughs at Positions ({model_name}): {positions[predicted_troughs]}")
+            
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(
+                x=positions,
+                y=predicted_dbm,
+                mode='lines',
+                name=f'Predicted dBm ({model_name})'
+            ))
+            fig.add_trace(go.Scatter(
+                x=positions[predicted_peaks],
+                y=predicted_dbm[predicted_peaks],
+                mode='markers',
+                name=f'Predicted Peaks ({model_name})',
+                marker=dict(color='red', size=10)
+            ))
+            fig.add_trace(go.Scatter(
+                x=positions[predicted_troughs],
+                y=predicted_dbm[predicted_troughs],
+                mode='markers',
+                name=f'Predicted Troughs ({model_name})',
+                marker=dict(color='blue', size=10)
+            ))
+            fig.update_layout(
+                title=f'Predicted dBm Values with Peaks and Troughs ({model_name})',
+                xaxis_title='Position (mm)',
+                yaxis_title='dBm',
+                legend_title='Type',
+                hovermode='closest',
+                width=1800,
+                height=900
+            )
+            st.write(f"Debug: {model_name} plot object created")
+            st.plotly_chart(fig)
+            st.write(f"Debug: {model_name} plot should be displayed now")
+        except Exception as e:
+            st.write(f"Error creating or displaying {model_name} plot: {str(e)}")
+
+    # Create and display plots for each model
+    create_and_display_plot(positions, predicted_dbm_rf, "Random Forest")
+    create_and_display_plot(positions, predicted_dbm_gbr, "Gradient Boosting Regressor")
+    create_and_display_plot(positions, predicted_dbm_svr, "Support Vector Regressor")
+
+    # Correlation Analysis for Peak and Trough Positions
+    st.subheader("Correlation Analysis for Peak and Trough Positions")
+    
+    # Extracting metadata for peaks and troughs
+    peaks_troughs_metadata = []
+    for df, metadata in zip(filtered_data_frames, filtered_metadata_list):
+        peaks, troughs = find_peaks_troughs(df['dBm'])
+        peaks_positions = df['Position'][peaks].tolist()
+        troughs_positions = df['Position'][troughs].tolist()
+        
+        for pos in peaks_positions:
+            peaks_troughs_metadata.append({**metadata, 'Type': 'Peak', 'Position': pos})
+        for pos in troughs_positions:
+            peaks_troughs_metadata.append({**metadata, 'Type': 'Trough', 'Position': pos})
+
+    peaks_troughs_df = pd.DataFrame(peaks_troughs_metadata)
+    
+    # Prepare data for correlation analysis
+    corr_features = ['delay', 'step', 'base_distance', 'surface_smooth', 'port']
+    peaks_troughs_df = pd.get_dummies(peaks_troughs_df, columns=['surface'], drop_first=True)
+    X_corr = peaks_troughs_df[corr_features]
+    y_corr = peaks_troughs_df['Position']
+
+    # Ensure all columns are numeric
+    X_corr = X_corr.apply(pd.to_numeric, errors='coerce').dropna()
+
+    # Train Random Forest model for correlation analysis
+    rf_corr = RandomForestRegressor()
+    rf_corr.fit(X_corr, y_corr)
+
+    # Extract feature importances using permutation importance
+    perm_importance = permutation_importance(rf_corr, X_corr, y_corr, n_repeats=30, random_state=42)
+
+    # Visualize feature importances using a bar chart
+    fig_corr_bar, ax_corr_bar = plt.subplots()
+    feature_importance_df = pd.DataFrame({'Feature': corr_features, 'Importance': perm_importance.importances_mean})
+    feature_importance_df.sort_values(by='Importance', ascending=False, inplace=True)
+    ax_corr_bar.bar(feature_importance_df['Feature'], feature_importance_df['Importance'], color='skyblue')
+    ax_corr_bar.set_title('Feature Importances for Peak and Trough Positions')
+    ax_corr_bar.set_ylabel('Importance')
+    st.pyplot(fig_corr_bar)
+
+    # Partial Dependence Plot
+    st.subheader("Partial Dependence Plot")
+    fig, ax = plt.subplots(figsize=(12, 8))
+    PartialDependenceDisplay.from_estimator(best_rf, X_train, features=[0, 1, 2, 3], ax=ax)
+    st.pyplot(fig)
 
 st.write("Upload CSV files to start analyzing data.")
 
